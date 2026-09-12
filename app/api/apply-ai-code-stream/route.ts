@@ -4,6 +4,7 @@ import { parseMorphEdits, applyMorphEditToFile } from '@/lib/morph-fast-apply';
 import type { SandboxState } from '@/types/sandbox';
 import type { ConversationState } from '@/types/conversation';
 import { sandboxManager } from '@/lib/sandbox/sandbox-manager';
+import { isSandboxNotFoundError, recoverSandbox } from '@/lib/sandbox/recovery';
 
 declare global {
   var conversationState: ConversationState | null;
@@ -310,79 +311,24 @@ export async function POST(request: NextRequest) {
       provider = global.activeSandboxProvider;
     }
 
-    // If we have a sandboxId but no provider, try to get or create one
+    // If we have a sandboxId but no provider, try to reconnect to it. A failure
+    // here is not fatal: the streaming task below rebuilds the sandbox through
+    // the recovery path, which also restores the cached files and reports the
+    // new sandbox id to the client.
     if (!provider && sandboxId) {
-      console.log(`[apply-ai-code-stream] No provider found for sandbox ${sandboxId}, attempting to get or create...`);
+      console.log(`[apply-ai-code-stream] No provider found for sandbox ${sandboxId}, attempting to reconnect...`);
 
       try {
-        provider = await sandboxManager.getOrCreateProvider(sandboxId);
-
-        // If we got a new provider (not reconnected), we need to create a new sandbox
-        if (!provider.getSandboxInfo()) {
-          console.log(`[apply-ai-code-stream] Creating new sandbox since reconnection failed for ${sandboxId}`);
-          await provider.createSandbox();
-          await provider.setupViteApp();
-          sandboxManager.registerSandbox(sandboxId, provider);
+        const reconnected = await sandboxManager.getOrCreateProvider(sandboxId);
+        if (reconnected?.getSandboxInfo()) {
+          provider = reconnected;
+          global.activeSandboxProvider = provider;
+          console.log(`[apply-ai-code-stream] Reconnected to sandbox ${sandboxId}`);
+        } else {
+          console.log(`[apply-ai-code-stream] Could not reconnect to ${sandboxId} - will rebuild during streaming`);
         }
-
-        // Update legacy global state
-        global.activeSandboxProvider = provider;
-        console.log(`[apply-ai-code-stream] Successfully got provider for sandbox ${sandboxId}`);
       } catch (providerError) {
-        console.error(`[apply-ai-code-stream] Failed to get or create provider for sandbox ${sandboxId}:`, providerError);
-        return NextResponse.json({
-          success: false,
-          error: `Failed to create sandbox provider for ${sandboxId}. The sandbox may have expired.`,
-          results: {
-            filesCreated: [],
-            packagesInstalled: [],
-            commandsExecuted: [],
-            errors: [`Sandbox provider creation failed: ${(providerError as Error).message}`]
-          },
-          explanation: parsed.explanation,
-          structure: parsed.structure,
-          parsedFiles: parsed.files,
-          message: `Parsed ${parsed.files.length} files but couldn't apply them - sandbox reconnection failed.`
-        }, { status: 500 });
-      }
-    }
-
-    // If we still don't have a provider, create a new one
-    if (!provider) {
-      console.log(`[apply-ai-code-stream] No active provider found, creating new sandbox...`);
-      try {
-        const { SandboxFactory } = await import('@/lib/sandbox/factory');
-        provider = SandboxFactory.create();
-        const sandboxInfo = await provider.createSandbox();
-        await provider.setupViteApp();
-
-        // Register with sandbox manager
-        sandboxManager.registerSandbox(sandboxInfo.sandboxId, provider);
-
-        // Store in legacy global state
-        global.activeSandboxProvider = provider;
-        global.sandboxData = {
-          sandboxId: sandboxInfo.sandboxId,
-          url: sandboxInfo.url
-        };
-
-        console.log(`[apply-ai-code-stream] Created new sandbox successfully`);
-      } catch (createError) {
-        console.error(`[apply-ai-code-stream] Failed to create new sandbox:`, createError);
-        return NextResponse.json({
-          success: false,
-          error: `Failed to create new sandbox: ${createError instanceof Error ? createError.message : 'Unknown error'}`,
-          results: {
-            filesCreated: [],
-            packagesInstalled: [],
-            commandsExecuted: [],
-            errors: [`Sandbox creation failed: ${createError instanceof Error ? createError.message : 'Unknown error'}`]
-          },
-          explanation: parsed.explanation,
-          structure: parsed.structure,
-          parsedFiles: parsed.files,
-          message: `Parsed ${parsed.files.length} files but couldn't apply them - sandbox creation failed.`
-        }, { status: 500 });
+        console.error(`[apply-ai-code-stream] Reconnect to ${sandboxId} failed, will rebuild during streaming:`, providerError);
       }
     }
 
@@ -398,7 +344,9 @@ export async function POST(request: NextRequest) {
     };
 
     // Start processing in background (pass provider and request to the async function)
-    (async (providerInstance, req) => {
+    // providerInstance may start out null - the preflight below rebuilds the
+    // sandbox and reassigns it before any work happens.
+    (async (providerInstance: any, req: NextRequest) => {
       const results = {
         filesCreated: [] as string[],
         filesUpdated: [] as string[],
@@ -409,12 +357,57 @@ export async function POST(request: NextRequest) {
         errors: [] as string[]
       };
 
+      // Rebuild the sandbox when it has disappeared (expired or killed) and tell
+      // the client to adopt the replacement, instead of surfacing an error.
+      const restartEnvironment = async () => {
+        await sendProgress({ type: 'sandbox-restarting', message: 'Startar om miljön…' });
+
+        const recovery = await recoverSandbox(async event => {
+          await sendProgress({
+            type: 'sandbox-restart-progress',
+            stage: event.stage,
+            message: event.message,
+            current: event.current,
+            total: event.total
+          });
+        });
+
+        providerInstance = recovery.provider;
+
+        await sendProgress({
+          type: 'sandbox-restarted',
+          sandboxId: recovery.sandboxId,
+          url: recovery.url,
+          filesRestored: recovery.filesRestored,
+          filesFailed: recovery.filesFailed,
+          packagesInstalled: recovery.packagesInstalled,
+          message: `Miljön startades om. ${recovery.filesRestored.length} filer återställdes.`
+        });
+
+        return recovery;
+      };
+
       try {
         await sendProgress({
           type: 'start',
           message: 'Starting code application...',
           totalSteps: 3
         });
+
+        // Package installation runs through a separate request, so check that the
+        // sandbox is still there before we get that far.
+        if (!providerInstance) {
+          await restartEnvironment();
+        } else {
+          try {
+            await providerInstance.runCommand('true');
+          } catch (preflightError) {
+            if (!isSandboxNotFoundError(preflightError)) {
+              throw preflightError;
+            }
+            await restartEnvironment();
+          }
+        }
         if (morphEnabled) {
           await sendProgress({ type: 'info', message: 'Morph Fast Apply enabled' });
           await sendProgress({ type: 'info', message: `Parsed ${morphEdits.length} Morph edits` });
@@ -589,6 +582,10 @@ export async function POST(request: NextRequest) {
         }
         
         for (const [index, file] of filteredFiles.entries()) {
+          // Hoisted so the recovery retry below can reuse the normalized values
+          let normalizedPath = file.path;
+          let fileContent = file.content;
+
           try {
             // Send progress for each file
             await sendProgress({
@@ -600,7 +597,6 @@ export async function POST(request: NextRequest) {
             });
 
             // Normalize the file path
-            let normalizedPath = file.path;
             if (normalizedPath.startsWith('/')) {
               normalizedPath = normalizedPath.substring(1);
             }
@@ -614,7 +610,6 @@ export async function POST(request: NextRequest) {
             const isUpdate = global.existingFiles.has(normalizedPath);
 
             // Remove any CSS imports from JSX/JS files (we're using Tailwind)
-            let fileContent = file.content;
             if (file.path.endsWith('.jsx') || file.path.endsWith('.js') || file.path.endsWith('.tsx') || file.path.endsWith('.ts')) {
               fileContent = fileContent.replace(/import\s+['"]\.\/[^'"]+\.css['"];?\s*\n?/g, '');
             }
@@ -658,6 +653,50 @@ export async function POST(request: NextRequest) {
               action: isUpdate ? 'updated' : 'created'
             });
           } catch (error) {
+            // The sandbox can expire mid-run - rebuild it and write this file again
+            // before treating it as a real failure.
+            if (isSandboxNotFoundError(error)) {
+              try {
+                await restartEnvironment();
+
+                const dirPath = normalizedPath.includes('/')
+                  ? normalizedPath.substring(0, normalizedPath.lastIndexOf('/'))
+                  : '';
+                if (dirPath) {
+                  await providerInstance.runCommand(`mkdir -p ${dirPath}`);
+                }
+                await providerInstance.writeFile(normalizedPath, fileContent);
+
+                if (global.sandboxState?.fileCache) {
+                  global.sandboxState.fileCache.files[normalizedPath] = {
+                    content: fileContent,
+                    lastModified: Date.now()
+                  };
+                }
+                if (results.filesCreated) results.filesCreated.push(normalizedPath);
+                if (global.existingFiles) global.existingFiles.add(normalizedPath);
+
+                await sendProgress({
+                  type: 'file-complete',
+                  fileName: normalizedPath,
+                  action: 'created'
+                });
+                continue;
+              } catch (retryError) {
+                if (results.errors) {
+                  results.errors.push(
+                    `Failed to create ${file.path} after restarting the sandbox: ${(retryError as Error).message}`
+                  );
+                }
+                await sendProgress({
+                  type: 'file-error',
+                  fileName: file.path,
+                  error: (retryError as Error).message
+                });
+                continue;
+              }
+            }
+
             if (results.errors) {
               results.errors.push(`Failed to create ${file.path}: ${(error as Error).message}`);
             }

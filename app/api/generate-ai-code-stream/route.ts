@@ -599,6 +599,11 @@ ${conversationContext}
    - Use existing icon libraries (lucide-react, heroicons, etc.)
    - Or use placeholder elements/text if icons are not critical
    - Only create custom SVGs when user specifically requests "create an SVG" or "draw an SVG"
+7. **NEVER IMPORT BRAND/SOCIAL ICONS FROM lucide-react**:
+   - FORBIDDEN: Facebook, Instagram, Linkedin, Twitter, Github - and any other brand mark
+   - ❌ WRONG: import { Facebook, Instagram, Twitter } from 'lucide-react'
+   - These icons were removed from lucide-react - importing them breaks the build
+   - For social links use a text label ("Facebook") or a generic lucide icon (Link, Share2, Globe, Mail)
 
 COMPONENT RELATIONSHIPS (CHECK THESE FIRST):
 - Navigation usually lives INSIDE Header.jsx, not separate Nav.jsx
@@ -879,10 +884,18 @@ CRITICAL COMPLETION RULES:
 2. NEVER say "Would you like me to proceed?"
 3. NEVER use <continue> tags
 4. Generate ALL components in ONE response
-5. If App.jsx imports 10 components, generate ALL 10
-6. Complete EVERYTHING before ending your response
+5. EVERY file App.jsx imports MUST be written in THIS response - walk the import list one by one and emit a <file> block for each; if App.jsx imports 10 components, generate ALL 10. An import with no matching <file> block is a broken build
+6. EVERY file MUST be COMPLETE and end with its closing </file> tag - never stop mid-file, never leave a <file> block unterminated
+7. NEVER write placeholder comments instead of real code:
+   ❌ // resten av koden
+   ❌ // rest of the code
+   ❌ // ... unchanged
+   ❌ // TODO: implement
+   ❌ /* same as before */
+   Write out the actual code every time, even when it repeats something you already wrote
+8. Complete EVERYTHING before ending your response
 
-With 16,000 tokens available, you have plenty of space to generate a complete application. Use it!
+With ${appConfig.ai.maxTokens.toLocaleString('en-US')} tokens available, you have plenty of space to generate a complete application. Use it!
 
 UNDERSTANDING USER INTENT FOR INCREMENTAL VS FULL GENERATION:
 - "add/create/make a [specific feature]" → Add ONLY that feature to existing app
@@ -1305,17 +1318,14 @@ If you're running out of space, generate FEWER files but make them COMPLETE.
 It's better to have 3 complete files than 10 incomplete files.`
             }
           ],
-          maxTokens: 8192, // Reduce to ensure completion
+          maxOutputTokens: appConfig.ai.maxTokens, // Keep in sync with the token budget stated in systemPrompt
           stopSequences: [] // Don't stop early
           // Note: Neither Groq nor Anthropic models support tool/function calling in this context
           // We use XML tags for package detection instead
         };
         
-        // Add temperature for non-reasoning models
-        if (!model.startsWith('openai/gpt-5')) {
-          streamOptions.temperature = 0.7;
-        }
-        
+        // Note: no temperature - sampling parameters are rejected by claude-sonnet-5
+
         // Add reasoning effort for GPT-5 models
         if (isOpenAI) {
           streamOptions.experimental_providerMetadata = {
@@ -1759,8 +1769,7 @@ Provide the complete file content without any truncation. Include all necessary 
                       content: 'You are completing a truncated file. Provide the complete, working file content.'
                     },
                     { role: 'user', content: completionPrompt }
-                  ],
-                  temperature: model.startsWith('openai/gpt-5') ? undefined : appConfig.ai.defaultTemperature
+                  ]
                 });
                 
                 // Get the full text from the stream

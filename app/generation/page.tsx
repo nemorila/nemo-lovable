@@ -398,7 +398,38 @@ function AISandboxPage() {
       return [...prev, { content, type, timestamp: new Date(), metadata }];
     });
   };
-  
+
+  // The server rebuilds the sandbox by itself when E2B reports it as gone. These
+  // handlers keep the user informed and point the client at the replacement.
+  const handleSandboxRestarting = () => {
+    updateStatus('Startar om miljön…', false);
+    addChatMessage('Startar om miljön…', 'system');
+  };
+
+  const handleSandboxRestarted = (data: any) => {
+    if (!data?.sandboxId || !data?.url) return;
+
+    console.log('[sandbox-restarted] Adopting new sandbox:', data.sandboxId);
+    setSandboxData(prev => ({ ...(prev || {}), sandboxId: data.sandboxId, url: data.url }));
+    updateStatus('Sandbox active', true);
+
+    const newParams = new URLSearchParams(searchParams.toString());
+    newParams.set('sandbox', data.sandboxId);
+    router.replace(`/generation?${newParams.toString()}`, { scroll: false });
+
+    if (iframeRef.current) {
+      iframeRef.current.src = data.url;
+    }
+
+    const restoredCount = Array.isArray(data.filesRestored) ? data.filesRestored.length : 0;
+    addChatMessage(
+      restoredCount > 0
+        ? `Miljön är igång igen - ${restoredCount} filer återställdes.`
+        : 'Miljön är igång igen.',
+      'system'
+    );
+  };
+
   const checkAndInstallPackages = async () => {
     // This function is only called when user explicitly requests it
     // Don't show error if no sandbox - it's likely being created
@@ -476,6 +507,16 @@ function AISandboxPage() {
                   break;
                 case 'status':
                   addChatMessage(data.message, 'system');
+                  break;
+                case 'sandbox-restarting':
+                  handleSandboxRestarting();
+                  break;
+                case 'sandbox-restart-progress':
+                  // Keep the chat quiet during the rebuild - status line is enough
+                  updateStatus(data.message, false);
+                  break;
+                case 'sandbox-restarted':
+                  handleSandboxRestarted(data);
                   break;
               }
             } catch (e) {
@@ -773,6 +814,19 @@ Tip: I automatically detect and install npm packages from your code imports (lik
                   if (data.message) {
                     addChatMessage(data.message, 'system');
                   }
+                  break;
+
+                case 'sandbox-restarting':
+                  handleSandboxRestarting();
+                  break;
+
+                case 'sandbox-restart-progress':
+                  // Keep the chat quiet during the rebuild - status line is enough
+                  updateStatus(data.message, false);
+                  break;
+
+                case 'sandbox-restarted':
+                  handleSandboxRestarted(data);
                   break;
               }
             } catch {

@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { isSandboxNotFoundError, recoverSandbox } from '@/lib/sandbox/recovery';
 
 declare global {
   var activeSandbox: any;
@@ -37,16 +38,11 @@ export async function POST(request: NextRequest) {
       console.log(`[install-packages] Cleaned:`, validPackages);
     }
     
-    // Get active sandbox provider
-    const provider = global.activeSandboxProvider;
-    
-    if (!provider) {
-      return NextResponse.json({ 
-        success: false, 
-        error: 'No active sandbox provider available' 
-      }, { status: 400 });
-    }
-    
+    // Get active sandbox provider. A missing provider is recoverable - the
+    // background task below rebuilds the sandbox and streams progress rather
+    // than failing the request.
+    const provider = global.activeSandboxProvider ?? null;
+
     console.log('[install-packages] Installing packages:', validPackages);
     
     // Create a response stream for real-time updates
@@ -62,13 +58,51 @@ export async function POST(request: NextRequest) {
     
     // Start installation in background
     (async (providerInstance) => {
-      try {
-        await sendProgress({ 
-          type: 'start', 
-          message: `Installing ${validPackages.length} package${validPackages.length > 1 ? 's' : ''}...`,
-          packages: validPackages 
+      // Rebuild a missing/expired sandbox and keep going against the replacement.
+      const restartEnvironment = async () => {
+        await sendProgress({ type: 'sandbox-restarting', message: 'Startar om miljön…' });
+
+        const recovery = await recoverSandbox(async event => {
+          await sendProgress({
+            type: 'sandbox-restart-progress',
+            stage: event.stage,
+            message: event.message,
+            current: event.current,
+            total: event.total
+          });
         });
-        
+
+        providerInstance = recovery.provider;
+
+        await sendProgress({
+          type: 'sandbox-restarted',
+          sandboxId: recovery.sandboxId,
+          url: recovery.url,
+          filesRestored: recovery.filesRestored,
+          message: `Miljön startades om. ${recovery.filesRestored.length} filer återställdes.`
+        });
+      };
+
+      try {
+        await sendProgress({
+          type: 'start',
+          message: `Installing ${validPackages.length} package${validPackages.length > 1 ? 's' : ''}...`,
+          packages: validPackages
+        });
+
+        if (!providerInstance) {
+          await restartEnvironment();
+        } else {
+          try {
+            await providerInstance.runCommand('true');
+          } catch (preflightError) {
+            if (!isSandboxNotFoundError(preflightError)) {
+              throw preflightError;
+            }
+            await restartEnvironment();
+          }
+        }
+
         // Stop any existing development server first
         await sendProgress({ type: 'status', message: 'Stopping development server...' });
         
