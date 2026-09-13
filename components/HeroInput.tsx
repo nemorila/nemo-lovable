@@ -2,6 +2,8 @@
 
 import { useState, KeyboardEvent, useEffect, useRef } from "react";
 
+export type InputMode = 'build' | 'chat';
+
 interface HeroInputProps {
   value: string;
   onChange: (value: string) => void;
@@ -9,6 +11,11 @@ interface HeroInputProps {
   placeholder?: string;
   className?: string;
   showSearchFeatures?: boolean;
+  // Optional - when omitted the mode toggle is hidden, so the landing page keeps
+  // using this component unchanged.
+  mode?: InputMode;
+  onModeChange?: (mode: InputMode) => void;
+  submitLabel?: string;
 }
 
 function isURL(str: string): boolean {
@@ -23,7 +30,10 @@ export default function HeroInput({
   onSubmit, 
   placeholder = "Describe what you want to build...",
   className = "",
-  showSearchFeatures = true
+  showSearchFeatures = true,
+  mode,
+  onModeChange,
+  submitLabel = "Re-imagine Site"
 }: HeroInputProps) {
   const [isFocused, setIsFocused] = useState(false);
   const [showTiles, setShowTiles] = useState(false);
@@ -131,7 +141,25 @@ export default function HeroInput({
           />
         </label>
 
-        <div className="p-10 flex justify-end items-center relative">
+        <div className={`p-10 flex items-center relative ${mode && onModeChange ? 'justify-between' : 'justify-end'}`}>
+          {mode && onModeChange && (
+            <div className="inline-flex bg-gray-100 border border-gray-200 rounded-md p-0.5">
+              {(['chat', 'build'] as const).map((option) => (
+                <button
+                  key={option}
+                  type="button"
+                  onClick={() => onModeChange(option)}
+                  className={`px-3 py-1 rounded transition-all text-xs font-medium ${
+                    mode === option
+                      ? 'bg-white text-gray-900 shadow-sm'
+                      : 'bg-transparent text-gray-600 hover:text-gray-900'
+                  }`}
+                >
+                  {option === 'chat' ? 'Chatt' : 'Bygg'}
+                </button>
+              ))}
+            </div>
+          )}
           <button
             onClick={onSubmit}
             disabled={!value.trim()}
@@ -147,7 +175,7 @@ export default function HeroInput({
             {value.trim() && <div className="button-background absolute inset-0 rounded-10 pointer-events-none" />}
             {value.trim() ? (
               <>
-                <span className="px-6 relative">Re-imagine Site</span>
+                <span className="px-6 relative">{submitLabel}</span>
                 <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
                   <path d="M3 8H13" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
                   <path d="M8.5 3.5L13 8L8.5 12.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>

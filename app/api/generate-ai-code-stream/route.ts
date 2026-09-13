@@ -90,7 +90,7 @@ declare global {
 
 export async function POST(request: NextRequest) {
   try {
-    const { prompt, model = 'openai/gpt-oss-20b', context, isEdit = false } = await request.json();
+    const { prompt, model = 'openai/gpt-oss-20b', context, isEdit = false, plan = null } = await request.json();
     
     console.log('[generate-ai-code-stream] Received request:');
     console.log('[generate-ai-code-stream] - prompt:', prompt);
@@ -575,9 +575,47 @@ Remember: You are a SURGEON making a precise incision, not an artist repainting 
           }
         }
         
+        // Build the approved-plan block. The plan comes from /api/plan-project and
+        // was explicitly approved by the user, so it outranks the model's own ideas
+        // about what to build.
+        const activePlan = plan ?? global.sandboxState?.plan ?? null;
+        let planContext = '';
+        if (activePlan) {
+          planContext = `\n\n## 📋 APPROVED BUILD PLAN - THIS IS THE SPEC\nThe user reviewed and approved this plan. Build exactly this.\n`;
+          planContext += `\nSummary: ${activePlan.summary}\n`;
+
+          if (activePlan.sections?.length) {
+            planContext += `\nSections (in this order):\n`;
+            for (const section of activePlan.sections) {
+              planContext += `- ${section.name}: ${section.description}\n`;
+            }
+          }
+
+          if (activePlan.components?.length) {
+            planContext += `\nComponents - you MUST generate EVERY ONE of these files in this response:\n`;
+            for (const component of activePlan.components) {
+              planContext += `- ${component.path} (${component.name}): ${component.description}\n`;
+            }
+            planContext += `\nThat is ${activePlan.components.length} files. Missing any of them breaks the build.\n`;
+          }
+
+          if (activePlan.theme) {
+            const colors = activePlan.theme.colors?.join(', ') || 'not specified';
+            planContext += `\nTheme: ${activePlan.theme.mood} | colors: ${colors} | typography: ${activePlan.theme.typography}\n`;
+          }
+
+          if (activePlan.packages?.length) {
+            planContext += `\nPackages available to import: ${activePlan.packages.join(', ')}\n`;
+          }
+
+          if (isEdit) {
+            planContext += `\nThis is an EDIT to a project already built from this plan. Use the plan as background only - follow the edit rules below and change ONLY what the user asked for.\n`;
+          }
+        }
+
         // Build system prompt with conversation awareness
         let systemPrompt = `You are an expert React developer with perfect memory of the conversation. You maintain context across messages and remember scraped websites, generated components, and applied code. Generate clean, modern React code for Vite applications.
-${conversationContext}
+${conversationContext}${planContext}
 
 🚨 CRITICAL RULES - YOUR MOST IMPORTANT INSTRUCTIONS:
 1. **DO EXACTLY WHAT IS ASKED - NOTHING MORE, NOTHING LESS**
@@ -843,7 +881,7 @@ WHEN WORKING WITH SCRAPED CONTENT:
 - ALWAYS sanitize all text content before using in code
 - Convert ALL smart quotes to straight quotes
 - Example transformations:
-  - "Firecrawl's API" → "Firecrawl's API" or "Firecrawl\\'s API"
+  - "Enkelsida AI's API" → "Enkelsida AI's API" or "Enkelsida AI\\'s API"
   - 'It's amazing' → "It's amazing" or 'It\\'s amazing'
   - "Best tool ever" → "Best tool ever"
 - When in doubt, use double quotes for strings containing apostrophes
@@ -893,7 +931,11 @@ CRITICAL COMPLETION RULES:
    ❌ // TODO: implement
    ❌ /* same as before */
    Write out the actual code every time, even when it repeats something you already wrote
-8. Complete EVERYTHING before ending your response
+8. FILENAMES MUST BE PascalCase AND MATCH THE COMPONENT NAME EXACTLY:
+   ✅ Header → src/components/Header.jsx
+   ❌ header.jsx, Header-component.jsx, HeaderComponent.jsx
+   Case matters - "header.jsx" breaks "import Header from './Header'" on Linux
+9. Complete EVERYTHING before ending your response
 
 With ${appConfig.ai.maxTokens.toLocaleString('en-US')} tokens available, you have plenty of space to generate a complete application. Use it!
 

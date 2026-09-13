@@ -25,6 +25,9 @@ import {
 } from '@/lib/icons';
 import { motion } from 'framer-motion';
 import CodeApplicationProgress, { type CodeApplicationState } from '@/components/CodeApplicationProgress';
+import PlanCard from '@/components/app/generation/PlanCard';
+import type { ProjectPlan, PlannedComponent } from '@/types/plan';
+import type { InputMode } from '@/components/HeroInput';
 
 interface SandboxData {
   sandboxId: string;
@@ -44,6 +47,8 @@ interface ChatMessage {
     commandType?: 'input' | 'output' | 'error' | 'success';
     brandingData?: any;
     sourceUrl?: string;
+    plan?: ProjectPlan;
+    planStatus?: 'pending' | 'revising' | 'approved';
   };
 }
 
@@ -76,6 +81,17 @@ function AISandboxPage() {
   ]);
   const [aiChatInput, setAiChatInput] = useState('');
   const [aiEnabled] = useState(true);
+  // Plan mode: a new project is planned before it is built. approvedPlanRef
+  // approvedPlanRef mirrors the approved plan so async flows read the current
+  // value, not a stale closure capture.
+  const [inputMode, setInputMode] = useState<InputMode>('build');
+  const approvedPlanRef = useRef<ProjectPlan | null>(null);
+  const missingRetryRef = useRef(false);
+  // Holds an in-flight sandbox creation started during planning so the build
+  // can await the same promise instead of racing a second creation.
+  const sandboxWarmupRef = useRef<Promise<any> | null>(null);
+  // The prompt the plan was built from - reused on revision and on approval
+  const [planPrompt, setPlanPrompt] = useState('');
   const searchParams = useSearchParams();
   const router = useRouter();
   const [aiModel, setAiModel] = useState(() => {
@@ -665,7 +681,7 @@ Tip: I automatically detect and install npm packages from your code imports (lik
     }
   };
 
-  const applyGeneratedCode = async (code: string, isEdit: boolean = false, overrideSandboxData?: SandboxData) => {
+  const applyGeneratedCode = async (code: string, isEdit: boolean = false, overrideSandboxData?: SandboxData, planForApply: ProjectPlan | null = null) => {
     setLoading(true);
     log('Applying AI-generated code...');
     
@@ -690,7 +706,8 @@ Tip: I automatically detect and install npm packages from your code imports (lik
           response: code,
           isEdit: isEdit,
           packages: pendingPackages,
-          sandboxId: effectiveSandboxData?.sandboxId // Pass the sandbox ID to ensure proper connection
+          sandboxId: effectiveSandboxData?.sandboxId, // Pass the sandbox ID to ensure proper connection
+          plan: planForApply ?? approvedPlanRef.current
         })
       });
       
@@ -702,6 +719,7 @@ Tip: I automatically detect and install npm packages from your code imports (lik
       const reader = response.body?.getReader();
       const decoder = new TextDecoder();
       let finalData: any = null;
+      let missingComponents: PlannedComponent[] = [];
       
       while (reader) {
         const { done, value } = await reader.read();
@@ -828,6 +846,10 @@ Tip: I automatically detect and install npm packages from your code imports (lik
                 case 'sandbox-restarted':
                   handleSandboxRestarted(data);
                   break;
+
+                case 'missing-components':
+                  missingComponents = Array.isArray(data.components) ? data.components : [];
+                  break;
               }
             } catch {
               // Ignore parse errors
@@ -835,7 +857,26 @@ Tip: I automatically detect and install npm packages from your code imports (lik
           }
         }
       }
-      
+
+      // The plan promised components the model never wrote. Ask for exactly
+      // those, once. A loop here could run forever if the model keeps skipping.
+      if (missingComponents.length > 0 && !missingRetryRef.current) {
+        missingRetryRef.current = true;
+        const names = missingComponents.map(c => c.name).join(', ');
+        addChatMessage(
+          `Planen innehöll ${missingComponents.length} komponenter som inte genererades (${names}). Begär dem automatiskt…`,
+          'system'
+        );
+        const followUp = missingComponents
+          .map(c => `- ${c.path} (${c.name}): ${c.description}`)
+          .join('\n');
+        await runBuildGeneration(
+          `Generate ONLY these missing files from the approved plan. Do not regenerate anything else:\n${followUp}`,
+          approvedPlanRef.current
+        );
+        return;
+      }
+
       // Process final data
       if (finalData && finalData.type === 'complete') {
         const data: any = {
@@ -1652,7 +1693,7 @@ Tip: I automatically detect and install npm packages from your code imports (lik
               ref={iframeRef}
               src={sandboxData.url}
               className="w-full h-full border-none"
-              title="Open Lovable Sandbox"
+              title="Enkelsida AI Sandbox"
               allow="clipboard-write"
               sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
             />
@@ -1773,15 +1814,21 @@ Tip: I automatically detect and install npm packages from your code imports (lik
   const sendChatMessage = async () => {
     const message = aiChatInput.trim();
     if (!message) return;
-    
+
     if (!aiEnabled) {
       addChatMessage('AI is disabled. Please enable it first.', 'system');
       return;
     }
-    
+
     addChatMessage(message, 'user');
     setAiChatInput('');
-    
+
+    // Chat mode answers in text only - no generation, no files touched
+    if (inputMode === 'chat') {
+      await sendChatOnlyMessage(message);
+      return;
+    }
+
     // Check for special commands
     const lowerMessage = message.toLowerCase().trim();
     if (lowerMessage === 'check packages' || lowerMessage === 'install packages' || lowerMessage === 'npm install') {
@@ -1793,18 +1840,165 @@ Tip: I automatically detect and install npm packages from your code imports (lik
       await checkAndInstallPackages();
       return;
     }
-    
+
+    // A brand new project gets planned before it gets built. Once code has been
+    // applied we are editing, and edits go straight through.
+    const isNewProject = conversationContext.appliedCode.length === 0;
+    if (isNewProject && !approvedPlanRef.current) {
+      await requestPlan(message);
+      return;
+    }
+
+    missingRetryRef.current = false;
+    await runBuildGeneration(message, approvedPlanRef.current);
+  };
+
+  const sendChatOnlyMessage = async (message: string) => {
+    setLoading(true);
+    try {
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: message,
+          model: aiModel,
+          context: { recentMessages: chatMessages.slice(-10) }
+        })
+      });
+
+      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+      let answer = '';
+      let buffer = '';
+
+      while (reader) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const data = JSON.parse(line.slice(6));
+            if (data.type === 'text') answer += data.text;
+            if (data.type === 'error') throw new Error(data.message);
+          } catch {
+            // ignore partial JSON
+          }
+        }
+      }
+
+      addChatMessage(answer.trim() || 'Inget svar.', 'ai');
+    } catch (error: any) {
+      addChatMessage(`Chatten misslyckades: ${error.message}`, 'system');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const requestPlan = async (message: string, currentPlan?: ProjectPlan, feedback?: string) => {
+    // Warm the sandbox while the plan is being written so approval is instant
+    if (!sandboxData && !sandboxCreationRef.current) {
+      sandboxWarmupRef.current = createSandbox(true).catch((error: any) => {
+        console.error('[requestPlan] Sandbox creation failed:', error);
+        sandboxWarmupRef.current = null;
+        throw error;
+      });
+    }
+
+    try {
+      const response = await fetch('/api/plan-project', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: message,
+          model: aiModel,
+          currentPlan,
+          feedback,
+          context: { structure: structureContent }
+        })
+      });
+
+      const data = await response.json();
+      if (!data.success) throw new Error(data.error || 'Planeringen misslyckades');
+
+      setPlanPrompt(message);
+      addChatMessage('', 'ai', { plan: data.plan, planStatus: 'pending' });
+    } catch (error: any) {
+      addChatMessage(`Kunde inte skapa en plan: ${error.message}`, 'system');
+    }
+  };
+
+  const revisePlan = async (feedback: string) => {
+    const index = chatMessages.findIndex(m => m.metadata?.plan && m.metadata?.planStatus !== 'approved');
+    if (index === -1) return;
+    const currentPlan = chatMessages[index].metadata!.plan!;
+
+    setChatMessages(prev => prev.map((m, i) =>
+      i === index ? { ...m, metadata: { ...m.metadata, planStatus: 'revising' as const } } : m
+    ));
+    addChatMessage(feedback, 'user');
+
+    try {
+      const response = await fetch('/api/plan-project', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: planPrompt,
+          model: aiModel,
+          currentPlan,
+          feedback,
+          context: { structure: structureContent }
+        })
+      });
+
+      const data = await response.json();
+      if (!data.success) throw new Error(data.error || 'Revideringen misslyckades');
+
+      setChatMessages(prev => prev.map((m, i) =>
+        i === index ? { ...m, metadata: { ...m.metadata, plan: data.plan, planStatus: 'pending' as const } } : m
+      ));
+    } catch (error: any) {
+      setChatMessages(prev => prev.map((m, i) =>
+        i === index ? { ...m, metadata: { ...m.metadata, planStatus: 'pending' as const } } : m
+      ));
+      addChatMessage(`Kunde inte uppdatera planen: ${error.message}`, 'system');
+    }
+  };
+
+  const approvePlan = async (plan: ProjectPlan) => {
+    approvedPlanRef.current = plan;
+    missingRetryRef.current = false;
+
+    setChatMessages(prev => prev.map(m =>
+      m.metadata?.plan ? { ...m, metadata: { ...m.metadata, planStatus: 'approved' as const } } : m
+    ));
+
+    await runBuildGeneration(planPrompt, plan);
+  };
+
+  const runBuildGeneration = async (message: string, planForBuild: ProjectPlan | null = null) => {
     // Start sandbox creation in parallel if needed
     let sandboxPromise: Promise<void> | null = null;
     let sandboxCreating = false;
     
     if (!sandboxData) {
       sandboxCreating = true;
-      addChatMessage('Creating sandbox while I plan your app...', 'system');
-      sandboxPromise = createSandbox(true).catch((error: any) => {
-        addChatMessage(`Failed to create sandbox: ${error.message}`, 'system');
-        throw error;
-      });
+      // Planning may already have started one - createSandbox() de-dupes by
+      // returning null, so reuse that promise or the build loses its sandbox.
+      if (sandboxWarmupRef.current) {
+        sandboxPromise = sandboxWarmupRef.current;
+      } else {
+        addChatMessage('Creating sandbox while I plan your app...', 'system');
+        sandboxPromise = createSandbox(true).catch((error: any) => {
+          addChatMessage(`Failed to create sandbox: ${error.message}`, 'system');
+          throw error;
+        });
+      }
     }
     
     // Determine if this is an edit
@@ -1856,7 +2050,8 @@ Tip: I automatically detect and install npm packages from your code imports (lik
           prompt: message,
           model: aiModel,
           context: fullContext,
-          isEdit: conversationContext.appliedCode.length > 0
+          isEdit: conversationContext.appliedCode.length > 0,
+          plan: planForBuild
         })
       });
       
@@ -3335,7 +3530,7 @@ Focus on the key sections and content, making it clean and modern.`;
   return (
     <HeaderProvider>
       <div className="font-sans bg-background text-foreground h-screen flex flex-col">
-      <div className="bg-white py-[15px] py-[8px] border-b border-border-faint flex items-center justify-between shadow-sm">
+      <div className="bg-white px-16 py-[8px] border-b border-border-faint flex items-center justify-between shadow-sm">
         <HeaderBrandKit />
         <div className="flex items-center gap-2">
           {/* Model Selector - Left side */}
@@ -3521,6 +3716,7 @@ Focus on the key sections and content, making it clean and modern.`;
                 <div key={idx} className="block">
                   <div className={`flex ${msg.type === 'user' ? 'justify-end' : 'justify-start'}`}>
                     <div className="block">
+                      {!(msg.metadata?.plan && !msg.content) && (
                       <div className={`block rounded-[10px] px-14 py-8 ${
                         msg.type === 'user' ? 'bg-[#36322F] text-white ml-auto max-w-[80%]' :
                         msg.type === 'ai' ? 'bg-gray-100 text-gray-900 mr-auto max-w-[80%]' :
@@ -3560,8 +3756,19 @@ Focus on the key sections and content, making it clean and modern.`;
                       <span className="text-sm">{msg.content}</span>
                     )}
                       </div>
+                      )}
                   
-                      {/* Show branding data if this is a brand extraction message */}
+                      {/* Build plan card with checklist and approve/revise actions */}
+                      {msg.metadata?.plan && (
+                        <PlanCard
+                          plan={msg.metadata.plan}
+                          status={msg.metadata.planStatus || 'pending'}
+                          onApprove={() => approvePlan(msg.metadata!.plan!)}
+                          onRevise={(feedback) => revisePlan(feedback)}
+                        />
+                      )}
+
+                    {/* Show branding data if this is a brand extraction message */}
                       {msg.metadata?.brandingData && (
                         <div className="mt-3 bg-gradient-to-br from-gray-50 to-white border-2 border-gray-200 rounded-xl overflow-hidden max-w-[500px] shadow-sm">
                           <div className="bg-[#36322F] px-16 py-12">
@@ -3904,8 +4111,11 @@ Focus on the key sections and content, making it clean and modern.`;
               value={aiChatInput}
               onChange={setAiChatInput}
               onSubmit={sendChatMessage}
-              placeholder="Describe what you want to build..."
+              placeholder={inputMode === 'chat' ? 'Ställ en fråga om projektet...' : 'Describe what you want to build...'}
               showSearchFeatures={false}
+              mode={inputMode}
+              onModeChange={setInputMode}
+              submitLabel={inputMode === 'chat' ? 'Skicka' : 'Bygg'}
             />
           </div>
         </div>

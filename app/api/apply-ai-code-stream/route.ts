@@ -5,6 +5,7 @@ import type { SandboxState } from '@/types/sandbox';
 import type { ConversationState } from '@/types/conversation';
 import { sandboxManager } from '@/lib/sandbox/sandbox-manager';
 import { isSandboxNotFoundError, recoverSandbox } from '@/lib/sandbox/recovery';
+import { findMissingComponents } from '@/lib/plan/missing-components';
 
 declare global {
   var conversationState: ConversationState | null;
@@ -264,7 +265,7 @@ function parseAIResponse(response: string): ParsedResponse {
 
 export async function POST(request: NextRequest) {
   try {
-    const { response, isEdit = false, packages = [], sandboxId } = await request.json();
+    const { response, isEdit = false, packages = [], sandboxId, plan = null } = await request.json();
 
     if (!response) {
       return NextResponse.json({
@@ -775,12 +776,39 @@ export async function POST(request: NextRequest) {
           }
         }
 
+        // Verify the approved plan was actually delivered. A component the plan
+        // promised but the model never wrote is an import that resolves to
+        // nothing - the build breaks with no obvious cause.
+        const activePlan = plan ?? global.sandboxState?.plan ?? null;
+        const missingComponents = findMissingComponents(activePlan, [
+          ...results.filesCreated,
+          ...results.filesUpdated
+        ]);
+
+        if (missingComponents.length > 0) {
+          console.log(
+            `[apply-ai-code-stream] Plan verification: ${missingComponents.length} of ${activePlan.components.length} components missing:`,
+            missingComponents.map(c => c.path).join(', ')
+          );
+          await sendProgress({
+            type: 'missing-components',
+            components: missingComponents,
+            message: `${missingComponents.length} planerade komponenter saknas - begär dem automatiskt…`
+          });
+        }
+
+        // Persist the approved plan so later edits can reference it
+        if (plan && global.sandboxState) {
+          global.sandboxState.plan = plan;
+        }
+
         // Send final results
         await sendProgress({
           type: 'complete',
           results,
           explanation: parsed.explanation,
           structure: parsed.structure,
+          missingComponents,
           message: `Successfully applied ${results.filesCreated.length} files`
         });
 

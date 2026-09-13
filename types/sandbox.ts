@@ -1,5 +1,7 @@
 // Global types for sandbox file management
 
+import type { ProjectPlan } from './plan';
+
 export interface SandboxFile {
   content: string;
   lastModified: number;
@@ -19,6 +21,9 @@ export interface SandboxState {
     sandboxId: string;
     url: string;
   } | null;
+  // The plan the user approved for this project, so later edits can reference
+  // it. Must survive a sandbox rebuild - see lib/sandbox/recovery.ts.
+  plan?: ProjectPlan | null;
 }
 
 // Declare global types

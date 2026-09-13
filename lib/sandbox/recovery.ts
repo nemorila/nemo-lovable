@@ -113,6 +113,9 @@ async function performRecovery(onProgress?: RecoveryProgress): Promise<SandboxRe
   const cachedFiles = { ...(global.sandboxState?.fileCache?.files ?? {}) };
   const cachedManifest = global.sandboxState?.fileCache?.manifest;
   const cachedPaths = Object.keys(cachedFiles);
+  // The approved build plan is project state, not sandbox state - carry it over
+  // or every rebuild silently drops it and later edits lose their reference.
+  const cachedPlan = global.sandboxState?.plan ?? null;
 
   console.log(`[recovery] Sandbox lost - rebuilding with ${cachedPaths.length} cached files`);
 
@@ -207,7 +210,8 @@ async function performRecovery(onProgress?: RecoveryProgress): Promise<SandboxRe
       manifest: cachedManifest
     },
     sandbox: provider,
-    sandboxData: { sandboxId: info.sandboxId, url: info.url }
+    sandboxData: { sandboxId: info.sandboxId, url: info.url },
+    plan: cachedPlan
   };
   global.existingFiles = new Set<string>([...SCAFFOLD_FILES, ...filesRestored]);
 
