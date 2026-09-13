@@ -6,6 +6,7 @@ import type { ConversationState } from '@/types/conversation';
 import { sandboxManager } from '@/lib/sandbox/sandbox-manager';
 import { isSandboxNotFoundError, recoverSandbox } from '@/lib/sandbox/recovery';
 import { findMissingComponents } from '@/lib/plan/missing-components';
+import { tryPersistProject } from '@/lib/projects/store';
 
 declare global {
   var conversationState: ConversationState | null;
@@ -265,7 +266,7 @@ function parseAIResponse(response: string): ParsedResponse {
 
 export async function POST(request: NextRequest) {
   try {
-    const { response, isEdit = false, packages = [], sandboxId, plan = null } = await request.json();
+    const { response, isEdit = false, packages = [], sandboxId, plan = null, projectId = null } = await request.json();
 
     if (!response) {
       return NextResponse.json({
@@ -371,7 +372,7 @@ export async function POST(request: NextRequest) {
             current: event.current,
             total: event.total
           });
-        });
+        }, projectId);
 
         providerInstance = recovery.provider;
 
@@ -457,7 +458,8 @@ export async function POST(request: NextRequest) {
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 packages: uniquePackages,
-                sandboxId: sandboxId || providerInstance.getSandboxInfo()?.sandboxId
+                sandboxId: sandboxId || providerInstance.getSandboxInfo()?.sandboxId,
+                projectId
               })
             });
 
@@ -802,6 +804,14 @@ export async function POST(request: NextRequest) {
           global.sandboxState.plan = plan;
         }
 
+        // Write the whole tree to Postgres. This is what makes the project
+        // outlive both the sandbox and the Next process; recovery reads it back.
+        const fileCache = global.sandboxState?.fileCache?.files ?? {};
+        const filesForDb = Object.fromEntries(
+          Object.entries(fileCache).map(([path, file]) => [path, file.content])
+        );
+        const persisted = await tryPersistProject(projectId, filesForDb, plan);
+
         // Send final results
         await sendProgress({
           type: 'complete',
@@ -809,6 +819,8 @@ export async function POST(request: NextRequest) {
           explanation: parsed.explanation,
           structure: parsed.structure,
           missingComponents,
+          persisted,
+          projectId,
           message: `Successfully applied ${results.filesCreated.length} files`
         });
 

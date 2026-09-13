@@ -3,6 +3,7 @@ import { SandboxFactory } from './factory';
 import { sandboxManager } from './sandbox-manager';
 import { appConfig } from '@/config/app.config';
 import type { SandboxState } from '@/types/sandbox';
+import { tryLoadProjectFiles } from '@/lib/projects/store';
 
 declare global {
   var activeSandbox: any;
@@ -95,22 +96,42 @@ let inFlightRecovery: Promise<SandboxRecoveryResult> | null = null;
  * from the in-memory cache, reinstall dependencies and repoint all global state
  * at the new sandbox.
  */
-export async function recoverSandbox(onProgress?: RecoveryProgress): Promise<SandboxRecoveryResult> {
+export async function recoverSandbox(
+  onProgress?: RecoveryProgress,
+  projectId?: string | null
+): Promise<SandboxRecoveryResult> {
   if (inFlightRecovery) {
     return inFlightRecovery;
   }
 
-  inFlightRecovery = performRecovery(onProgress).finally(() => {
+  inFlightRecovery = performRecovery(onProgress, projectId).finally(() => {
     inFlightRecovery = null;
   });
 
   return inFlightRecovery;
 }
 
-async function performRecovery(onProgress?: RecoveryProgress): Promise<SandboxRecoveryResult> {
-  // Snapshot the cache BEFORE tearing anything down - this is the only record
-  // of the user's project once the sandbox is gone.
-  const cachedFiles = { ...(global.sandboxState?.fileCache?.files ?? {}) };
+async function performRecovery(
+  onProgress?: RecoveryProgress,
+  projectId?: string | null
+): Promise<SandboxRecoveryResult> {
+  // The database is the source of truth: it survives a Next process restart,
+  // which the in-memory cache does not. Fall back to the cache only when there
+  // is no row to read.
+  const persistedFiles = await tryLoadProjectFiles(projectId);
+
+  const cachedFiles: Record<string, { content: string; lastModified: number }> = persistedFiles
+    ? Object.fromEntries(
+        Object.entries(persistedFiles).map(([path, content]) => [
+          path,
+          { content, lastModified: Date.now() },
+        ])
+      )
+    : { ...(global.sandboxState?.fileCache?.files ?? {}) };
+
+  if (persistedFiles) {
+    console.log(`[recovery] Restoring ${Object.keys(persistedFiles).length} files from project ${projectId}`);
+  }
   const cachedManifest = global.sandboxState?.fileCache?.manifest;
   const cachedPaths = Object.keys(cachedFiles);
   // The approved build plan is project state, not sandbox state - carry it over
@@ -245,7 +266,7 @@ async function performRecovery(onProgress?: RecoveryProgress): Promise<SandboxRe
  */
 export async function runWithSandboxRecovery<T>(
   run: (provider: any) => Promise<T>,
-  options: { provider?: any; onProgress?: RecoveryProgress } = {}
+  options: { provider?: any; onProgress?: RecoveryProgress; projectId?: string | null } = {}
 ): Promise<{ result: T; recovery: SandboxRecoveryResult | null }> {
   const provider = options.provider ?? global.activeSandboxProvider;
 
@@ -260,7 +281,7 @@ export async function runWithSandboxRecovery<T>(
     }
 
     console.log('[recovery] Operation hit a missing sandbox, rebuilding…');
-    const recovery = await recoverSandbox(options.onProgress);
+    const recovery = await recoverSandbox(options.onProgress, options.projectId);
     return { result: await run(recovery.provider), recovery };
   }
 }

@@ -1,7 +1,7 @@
 'use client';
 
-import { useState, useEffect, useRef, Suspense } from 'react';
-import { useSearchParams, useRouter } from 'next/navigation';
+import { useState, useEffect, useRef, Suspense, useCallback } from 'react';
+import { useSearchParams, useRouter, useParams } from 'next/navigation';
 import Image from 'next/image';
 import { appConfig } from '@/config/app.config';
 import HeroInput from '@/components/HeroInput';
@@ -94,6 +94,15 @@ function AISandboxPage() {
   const [planPrompt, setPlanPrompt] = useState('');
   const searchParams = useSearchParams();
   const router = useRouter();
+  const routeParams = useParams();
+  // Present under /project/<uuid>, absent under /generation
+  const routeProjectId = typeof routeParams?.id === 'string' ? routeParams.id : null;
+  const [projectId, setProjectId] = useState<string | null>(routeProjectId);
+  const projectIdRef = useRef<string | null>(routeProjectId);
+  // Whether a static build has been published for this project yet
+  const [previewPublishedAt, setPreviewPublishedAt] = useState<number | null>(null);
+  // When set, the iframe shows the sandbox dev URL instead of the static preview
+  const [liveSandboxUrl, setLiveSandboxUrl] = useState<string | null>(null);
   const [aiModel, setAiModel] = useState(() => {
     const modelParam = searchParams.get('model');
     return appConfig.ai.availableModels.includes(modelParam || '') ? modelParam! : appConfig.ai.defaultModel;
@@ -415,6 +424,108 @@ function AISandboxPage() {
     });
   };
 
+  // An existing project may already have a published build. Without this check
+  // the "Bygger din sida…" overlay would sit on top of a working preview forever.
+  useEffect(() => {
+    if (!routeProjectId) return;
+    let cancelled = false;
+
+    fetch(`/preview/${routeProjectId}/`, { method: 'HEAD' })
+      .then(response => {
+        if (!cancelled && response.headers.get('X-Preview-Status') === 'ready') {
+          setPreviewPublishedAt(Date.now());
+        }
+      })
+      .catch(() => {
+        // Treat as unpublished - the overlay stays until the first build lands
+      });
+
+    return () => { cancelled = true; };
+  }, [routeProjectId]);
+
+  // Keeps the sandbox alive while this tab is open. Gated on visibility so a
+  // forgotten background tab does not hold a sandbox (and its cost) forever.
+  useEffect(() => {
+    if (!sandboxData?.sandboxId) return;
+
+    const beat = () => {
+      if (document.visibilityState !== 'visible') return;
+      fetch('/api/sandbox-heartbeat', { method: 'POST' }).catch(() => {
+        // A failed heartbeat is not actionable - recovery handles a dead sandbox
+      });
+    };
+
+    beat();
+    const interval = setInterval(beat, 60_000);
+    return () => clearInterval(interval);
+  }, [sandboxData?.sandboxId]);
+
+  /** Creates the project row on first use and moves the URL to /project/<uuid>. */
+  const ensureProject = useCallback(async (): Promise<string | null> => {
+    if (projectIdRef.current) return projectIdRef.current;
+
+    try {
+      const response = await fetch('/api/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Untitled' })
+      });
+      const data = await response.json();
+      if (!data.success) throw new Error(data.error || 'Kunde inte skapa projekt');
+
+      projectIdRef.current = data.project.id;
+      setProjectId(data.project.id);
+      router.replace(`/project/${data.project.id}`, { scroll: false });
+      return data.project.id;
+    } catch (error) {
+      // Supabase being unavailable must not block building - the project just
+      // will not survive the sandbox in that case.
+      console.error('[ensureProject] Failed:', error);
+      return null;
+    }
+  }, [router]);
+
+  /**
+   * Publishes the built site to Storage so the preview outlives the sandbox.
+   * Runs after a successful apply with no missing components.
+   */
+  const publishPreview = useCallback(async (id: string | null) => {
+    if (!id) return;
+    try {
+      const response = await fetch('/api/publish-preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId: id })
+      });
+      const data = await response.json();
+      if (!data.success) {
+        console.error('[publishPreview] Failed:', data.error);
+        return;
+      }
+      // Back to the static build, cache-busted so the new bundle shows up
+      setLiveSandboxUrl(null);
+      setPreviewPublishedAt(Date.now());
+    } catch (error) {
+      console.error('[publishPreview] Failed:', error);
+    }
+  }, []);
+
+  /**
+   * Points the iframe at the sandbox dev URL, but only once a real round trip
+   * confirms the sandbox is alive. Without the probe a reaped sandbox renders
+   * E2B's "Sandbox Not Found" page inside the frame.
+   */
+  const showLiveSandbox = useCallback(async (url?: string | null) => {
+    if (!url) return;
+    try {
+      const response = await fetch('/api/sandbox-status?probe=1');
+      const data = await response.json();
+      if (data.healthy) setLiveSandboxUrl(url);
+    } catch {
+      // Stay on the static preview
+    }
+  }, []);
+
   // The server rebuilds the sandbox by itself when E2B reports it as gone. These
   // handlers keep the user informed and point the client at the replacement.
   const handleSandboxRestarting = () => {
@@ -470,7 +581,7 @@ function AISandboxPage() {
   
   const installPackages = async (packages: string[]) => {
     if (!sandboxData) {
-      addChatMessage('No active sandbox. Create a sandbox first!', 'system');
+      // A missing sandbox is recreated silently rather than reported
       return;
     }
     
@@ -478,7 +589,7 @@ function AISandboxPage() {
       const response = await fetch('/api/install-packages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ packages })
+        body: JSON.stringify({ packages, projectId: projectIdRef.current })
       });
       
       if (!response.ok) {
@@ -707,7 +818,8 @@ Tip: I automatically detect and install npm packages from your code imports (lik
           isEdit: isEdit,
           packages: pendingPackages,
           sandboxId: effectiveSandboxData?.sandboxId, // Pass the sandbox ID to ensure proper connection
-          plan: planForApply ?? approvedPlanRef.current
+          plan: planForApply ?? approvedPlanRef.current,
+          projectId: projectIdRef.current
         })
       });
       
@@ -875,6 +987,15 @@ Tip: I automatically detect and install npm packages from your code imports (lik
           approvedPlanRef.current
         );
         return;
+      }
+
+      // A complete build with nothing missing is what gets published, so the
+      // preview stops depending on the sandbox staying alive.
+      if (missingComponents.length === 0) {
+        // Not awaited: vite build plus upload takes tens of seconds, and the
+        // rest of the apply flow (chat updates, iframe refresh) must not stall
+        // behind it. The preview swaps in when it finishes.
+        void publishPreview(projectIdRef.current);
       }
 
       // Process final data
@@ -1685,18 +1806,37 @@ Tip: I automatically detect and install npm packages from your code imports (lik
         );
       }
       
-      // Show sandbox iframe - keep showing during edits, only hide during initial loading
-      if (sandboxData?.url) {
+      // The preview is the static build from Storage by default - it outlives the
+      // sandbox. We only swap to the sandbox dev URL while generating, and only
+      // after a probe confirmed the sandbox is alive.
+      const previewSrc = liveSandboxUrl
+        ? liveSandboxUrl
+        : projectId
+          ? `/preview/${projectId}/${previewPublishedAt ? `?v=${previewPublishedAt}` : ''}`
+          : null;
+
+      if (previewSrc) {
         return (
           <div className="relative w-full h-full">
             <iframe
               ref={iframeRef}
-              src={sandboxData.url}
+              src={previewSrc}
               className="w-full h-full border-none"
-              title="Enkelsida AI Sandbox"
+              title="Enkelsida AI Preview"
               allow="clipboard-write"
               sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
             />
+
+            {/* Before the first publish there is nothing in Storage. The route
+                serves its own placeholder, but this overlay matches app typography. */}
+            {!previewPublishedAt && !liveSandboxUrl && (
+              <div className="absolute inset-0 bg-gray-900 flex items-center justify-center z-10">
+                <div className="text-center">
+                  <div className="w-10 h-10 border-2 border-gray-600 border-t-transparent rounded-full animate-spin mx-auto mb-4" />
+                  <p className="text-gray-300 text-sm">Bygger din sida…</p>
+                </div>
+              </div>
+            )}
             
             {/* Package installation overlay - shows when installing packages or applying code */}
             {codeApplicationState.stage && codeApplicationState.stage !== 'complete' && (
@@ -1770,10 +1910,12 @@ Tip: I automatically detect and install npm packages from your code imports (lik
             {/* Refresh button */}
             <button
               onClick={() => {
-                if (iframeRef.current && sandboxData?.url) {
-                  console.log('[Manual Refresh] Forcing iframe reload...');
-                  const newSrc = `${sandboxData.url}?t=${Date.now()}&manual=true`;
-                  iframeRef.current.src = newSrc;
+                if (!iframeRef.current) return;
+                // Reload whatever the frame is currently showing - never point it
+                // at a sandbox URL that has not been probed.
+                const base = liveSandboxUrl ?? (projectId ? `/preview/${projectId}/` : null);
+                if (base) {
+                  iframeRef.current.src = `${base}${base.includes('?') ? '&' : '?'}t=${Date.now()}`;
                 }
               }}
               className="absolute bottom-4 right-4 bg-white/90 hover:bg-white text-gray-700 p-2 rounded-lg shadow-lg transition-all duration-200 hover:scale-105"
@@ -1787,18 +1929,14 @@ Tip: I automatically detect and install npm packages from your code imports (lik
         );
       }
       
-      // Default state when no sandbox and no screenshot
+      // No project yet - nothing has been asked for. A missing sandbox is never
+      // surfaced as a state of its own; it is recreated silently instead.
       return (
         <div className="flex items-center justify-center h-full bg-gray-50 text-gray-600 text-lg">
           {screenshotError ? (
             <div className="text-center">
               <p className="mb-2">Failed to capture screenshot</p>
               <p className="text-sm text-gray-500">{screenshotError}</p>
-            </div>
-          ) : sandboxData ? (
-            <div className="text-gray-500">
-              <div className="w-16 h-16 border-2 border-gray-300 border-t-transparent rounded-full animate-spin mx-auto mb-2" />
-              <p className="text-sm">Loading preview...</p>
             </div>
           ) : (
             <div className="text-gray-500 text-center">
@@ -1850,6 +1988,7 @@ Tip: I automatically detect and install npm packages from your code imports (lik
     }
 
     missingRetryRef.current = false;
+    await ensureProject();
     await runBuildGeneration(message, approvedPlanRef.current);
   };
 
@@ -1901,6 +2040,7 @@ Tip: I automatically detect and install npm packages from your code imports (lik
   };
 
   const requestPlan = async (message: string, currentPlan?: ProjectPlan, feedback?: string) => {
+    void ensureProject();
     // Warm the sandbox while the plan is being written so approval is instant
     if (!sandboxData && !sandboxCreationRef.current) {
       sandboxWarmupRef.current = createSandbox(true).catch((error: any) => {
@@ -1974,6 +2114,17 @@ Tip: I automatically detect and install npm packages from your code imports (lik
     approvedPlanRef.current = plan;
     missingRetryRef.current = false;
 
+    // The plan becomes durable the moment it is approved - it must not wait for
+    // a successful build.
+    const id = await ensureProject();
+    if (id) {
+      fetch(`/api/projects/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ plan })
+      }).catch(error => console.error('[approvePlan] Failed to save plan:', error));
+    }
+
     setChatMessages(prev => prev.map(m =>
       m.metadata?.plan ? { ...m, metadata: { ...m.metadata, planStatus: 'approved' as const } } : m
     ));
@@ -1993,9 +2144,11 @@ Tip: I automatically detect and install npm packages from your code imports (lik
       if (sandboxWarmupRef.current) {
         sandboxPromise = sandboxWarmupRef.current;
       } else {
-        addChatMessage('Creating sandbox while I plan your app...', 'system');
+        // Recreated silently - the user sees "Bygger…" in the status line, not a
+        // message about a sandbox they never asked about.
+        updateStatus('Bygger…', false);
         sandboxPromise = createSandbox(true).catch((error: any) => {
-          addChatMessage(`Failed to create sandbox: ${error.message}`, 'system');
+          console.error('[runBuildGeneration] Sandbox creation failed:', error);
           throw error;
         });
       }
@@ -2025,6 +2178,10 @@ Tip: I automatically detect and install npm packages from your code imports (lik
         files: prev.files
       }));
       
+      // Show the live sandbox while generating so edits are visible immediately.
+      // Probed first - an unprobed URL risks E2B's error page in the frame.
+      void showLiveSandbox(sandboxData?.url);
+
       // Backend now manages file state - no need to fetch from frontend
       console.log('[chat] Using backend file cache for context');
       
@@ -2453,7 +2610,7 @@ Tip: I automatically detect and install npm packages from your code imports (lik
     }
     
     if (!sandboxData) {
-      addChatMessage('Please create a sandbox first', 'system');
+      // A missing sandbox is recreated silently rather than reported
       return;
     }
     

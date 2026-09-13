@@ -232,6 +232,11 @@ export class VercelProvider extends SandboxProvider {
     return stdout;
   }
 
+  async readFileBytes(_path: string): Promise<Uint8Array> {
+    // Only the E2B path publishes previews today.
+    throw new Error('readFileBytes not implemented for the Vercel provider');
+  }
+
   async listFiles(directory: string = '/vercel/sandbox'): Promise<string[]> {
     if (!this.sandbox) {
       throw new Error('No active sandbox');

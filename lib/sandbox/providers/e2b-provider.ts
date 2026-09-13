@@ -152,6 +152,32 @@ export class E2BProvider extends SandboxProvider {
     return result.logs.stdout.join('\n');
   }
 
+  async readFileBytes(path: string): Promise<Uint8Array> {
+    if (!this.sandbox) {
+      throw new Error('No active sandbox');
+    }
+
+    const fullPath = path.startsWith('/') ? path : `/home/user/app/${path}`;
+    const files = (this.sandbox as any).files;
+
+    if (!files || typeof files.read !== 'function') {
+      throw new Error('E2B filesystem API unavailable - cannot read bytes safely');
+    }
+
+    const bytes = await files.read(fullPath, { format: 'bytes' });
+    return bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  }
+
+  async extendTimeout(timeoutMs: number): Promise<void> {
+    if (!this.sandbox) {
+      throw new Error('No active sandbox');
+    }
+    if (typeof this.sandbox.setTimeout !== 'function') {
+      throw new Error('E2B sandbox does not expose setTimeout');
+    }
+    await this.sandbox.setTimeout(timeoutMs);
+  }
+
   async listFiles(directory: string = '/home/user/app'): Promise<string[]> {
     if (!this.sandbox) {
       throw new Error('No active sandbox');

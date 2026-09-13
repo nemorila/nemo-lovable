@@ -9,7 +9,7 @@ declare global {
 
 export async function POST(request: NextRequest) {
   try {
-    const { packages } = await request.json();
+    const { packages, projectId = null } = await request.json();
     // sandboxId not used - using global sandbox
     
     if (!packages || !Array.isArray(packages) || packages.length === 0) {
@@ -70,7 +70,7 @@ export async function POST(request: NextRequest) {
             current: event.current,
             total: event.total
           });
-        });
+        }, projectId);
 
         providerInstance = recovery.provider;
 

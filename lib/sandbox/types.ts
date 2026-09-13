@@ -45,6 +45,12 @@ export abstract class SandboxProvider {
   abstract runCommand(command: string): Promise<CommandResult>;
   abstract writeFile(path: string, content: string): Promise<void>;
   abstract readFile(path: string): Promise<string>;
+  /**
+   * Binary-safe read. readFile() goes through a Python print() and mangles
+   * newlines and binary bytes, so anything that is not plain source must use
+   * this instead - notably built assets (images, fonts) headed for Storage.
+   */
+  abstract readFileBytes(path: string): Promise<Uint8Array>;
   abstract listFiles(directory?: string): Promise<string[]>;
   abstract installPackages(packages: string[]): Promise<CommandResult>;
   abstract getSandboxUrl(): string | null;
@@ -61,5 +67,10 @@ export abstract class SandboxProvider {
   async restartViteServer(): Promise<void> {
     // Default implementation for restarting Vite
     throw new Error('restartViteServer not implemented for this provider');
+  }
+
+  /** Pushes the sandbox's idle timeout out, used by the client heartbeat. */
+  async extendTimeout(_timeoutMs: number): Promise<void> {
+    throw new Error('extendTimeout not implemented for this provider');
   }
 }

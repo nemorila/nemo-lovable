@@ -1,4 +1,4 @@
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import { sandboxManager } from '@/lib/sandbox/sandbox-manager';
 
 declare global {
@@ -7,8 +7,13 @@ declare global {
   var existingFiles: Set<string>;
 }
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   try {
+    // getSandboxInfo() only reads server memory, so a sandbox that E2B already
+    // reaped still reports healthy. ?probe=1 does a real round trip - required
+    // before pointing the iframe at a dev URL, or the user gets E2B's
+    // "Sandbox Not Found" page inside the frame.
+    const probe = request.nextUrl.searchParams.get('probe') === '1';
     // Check sandbox manager first, then fall back to global state
     const provider = sandboxManager.getActiveProvider() || global.activeSandboxProvider;
     const sandboxExists = !!provider;
@@ -21,6 +26,15 @@ export async function GET() {
         // Check if sandbox is healthy by getting its info
         const providerInfo = provider.getSandboxInfo();
         sandboxHealthy = !!providerInfo;
+
+        if (sandboxHealthy && probe) {
+          try {
+            await provider.runCommand('true');
+          } catch (probeError) {
+            console.log('[sandbox-status] Liveness probe failed:', (probeError as Error).message);
+            sandboxHealthy = false;
+          }
+        }
         
         sandboxInfo = {
           sandboxId: providerInfo?.sandboxId || global.sandboxData?.sandboxId,
