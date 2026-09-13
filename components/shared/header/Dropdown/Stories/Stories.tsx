@@ -21,7 +21,7 @@ export default function HeaderDropdownStories() {
       <Replit />
 
       <div className="text-title-h5 mt-31 pr-32">
-        How Replit uses <span className="text-heat-100">Firecrawl</span> to
+        How Replit uses <span className="text-heat-100">Enkelsida AI</span> to
         power Replit Agent
       </div>
 
