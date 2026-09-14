@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { isSandboxNotFoundError, recoverSandbox } from '@/lib/sandbox/recovery';
+import { getSessionUser } from '@/lib/auth/session';
+import { requireOwnedProject } from '@/lib/projects/authorize';
 
 declare global {
   var activeSandbox: any;
@@ -30,7 +32,21 @@ export async function POST(request: NextRequest) {
         error: 'No valid package names provided'
       }, { status: 400 });
     }
-    
+
+    if (projectId) {
+      const user = await getSessionUser();
+      if (!user) {
+        return NextResponse.json({ success: false, error: 'Unauthorized' }, { status: 401 });
+      }
+      const ownership = await requireOwnedProject(projectId, user.id);
+      if (!ownership.ok) {
+        return NextResponse.json(
+          { success: false, error: ownership.status === 404 ? 'Project not found' : 'Forbidden' },
+          { status: ownership.status }
+        );
+      }
+    }
+
     // Log if duplicates were found
     if (packages.length !== validPackages.length) {
       console.log(`[install-packages] Cleaned packages: removed ${packages.length - validPackages.length} invalid/duplicate entries`);

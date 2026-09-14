@@ -8,6 +8,9 @@ import HeroInput from '@/components/HeroInput';
 import SidebarInput from '@/components/app/generation/SidebarInput';
 import HeaderBrandKit from '@/components/shared/header/BrandKit/BrandKit';
 import { HeaderProvider } from '@/components/shared/header/HeaderContext';
+import AuthHeaderControl from '@/components/auth/AuthHeaderControl';
+import { summarizePageContent } from '@/lib/plan/summarize-page-content';
+import { PREVIEW_STATUS_HEADER } from '@/lib/preview/constants';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 // Import icons from centralized module to avoid Turbopack chunk issues
@@ -185,6 +188,13 @@ function AISandboxPage() {
   // Store flag to trigger generation after component mounts
   const [shouldAutoGenerate, setShouldAutoGenerate] = useState(false);
 
+  // Set when the homepage created this project from a free-text prompt (and
+  // optional reference URL) and handed off here to start plan mode.
+  const [pendingPlanRequest, setPendingPlanRequest] = useState<{
+    prompt: string;
+    referenceUrl?: string;
+  } | null>(null);
+
   // Clear old conversation data on component mount and create/restore sandbox
   useEffect(() => {
     let isMounted = true;
@@ -204,8 +214,24 @@ function AISandboxPage() {
       const storedStyle = templateParam || sessionStorage.getItem('selectedStyle');
       const storedModel = sessionStorage.getItem('selectedModel');
       const storedInstructions = sessionStorage.getItem('additionalInstructions');
-      
-      if (storedUrl) {
+
+      // Homepage prompt-first flow: the project already exists (we're on
+      // /project/<uuid>) and a free-text prompt is waiting to kick off plan
+      // mode, optionally with a reference URL to fold in as extra context.
+      const pendingPrompt = routeProjectId ? sessionStorage.getItem('pendingPrompt') : null;
+      const pendingReferenceUrl = pendingPrompt ? sessionStorage.getItem('pendingReferenceUrl') : null;
+
+      if (pendingPrompt) {
+        sessionStorage.removeItem('pendingPrompt');
+        sessionStorage.removeItem('pendingReferenceUrl');
+        if (storedModel) {
+          sessionStorage.removeItem('selectedModel');
+          setAiModel(storedModel);
+        }
+        setShowHomeScreen(false);
+        setHomeScreenFading(false);
+        setPendingPlanRequest({ prompt: pendingPrompt, referenceUrl: pendingReferenceUrl || undefined });
+      } else if (storedUrl) {
         // Mark that we have an initial submission since we're loading with a URL
         setHasInitialSubmission(true);
         
@@ -403,6 +429,39 @@ function AISandboxPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shouldAutoGenerate, homeUrlInput, showHomeScreen]);
 
+  // Kick off plan mode for a prompt handed off from the homepage. Runs once
+  // per pending request; a scrape failure for the optional reference URL
+  // must not block planning, so it just falls back to no extra context.
+  useEffect(() => {
+    if (!pendingPlanRequest) return;
+    const { prompt, referenceUrl } = pendingPlanRequest;
+    setPendingPlanRequest(null);
+
+    (async () => {
+      addChatMessage(prompt, 'user');
+
+      let referenceContext: string | undefined;
+      if (referenceUrl) {
+        try {
+          const res = await fetch('/api/scrape-url-enhanced', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: referenceUrl }),
+          });
+          const data = await res.json();
+          if (data.success) {
+            referenceContext = summarizePageContent(data.structured?.content || data.content || '');
+          }
+        } catch (error) {
+          console.error('[pending-plan] Failed to scrape reference URL:', error);
+        }
+      }
+
+      await requestPlan(prompt, undefined, undefined, referenceContext);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingPlanRequest]);
+
   const updateStatus = (text: string, active: boolean) => {
     setStatus({ text, active });
   };
@@ -432,7 +491,7 @@ function AISandboxPage() {
 
     fetch(`/preview/${routeProjectId}/`, { method: 'HEAD' })
       .then(response => {
-        if (!cancelled && response.headers.get('X-Preview-Status') === 'ready') {
+        if (!cancelled && response.headers.get(PREVIEW_STATUS_HEADER) === 'ready') {
           setPreviewPublishedAt(Date.now());
         }
       })
@@ -2039,8 +2098,13 @@ Tip: I automatically detect and install npm packages from your code imports (lik
     }
   };
 
-  const requestPlan = async (message: string, currentPlan?: ProjectPlan, feedback?: string) => {
-    void ensureProject();
+  const requestPlan = async (
+    message: string,
+    currentPlan?: ProjectPlan,
+    feedback?: string,
+    referenceContext?: string
+  ) => {
+    const id = await ensureProject();
     // Warm the sandbox while the plan is being written so approval is instant
     if (!sandboxData && !sandboxCreationRef.current) {
       sandboxWarmupRef.current = createSandbox(true).catch((error: any) => {
@@ -2059,7 +2123,7 @@ Tip: I automatically detect and install npm packages from your code imports (lik
           model: aiModel,
           currentPlan,
           feedback,
-          context: { structure: structureContent }
+          context: { structure: structureContent, referencePage: referenceContext }
         })
       });
 
@@ -2068,6 +2132,14 @@ Tip: I automatically detect and install npm packages from your code imports (lik
 
       setPlanPrompt(message);
       addChatMessage('', 'ai', { plan: data.plan, planStatus: 'pending' });
+
+      if (id && data.plan?.name) {
+        fetch(`/api/projects/${id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: data.plan.name })
+        }).catch(error => console.error('[requestPlan] Failed to save project name:', error));
+      }
     } catch (error: any) {
       addChatMessage(`Kunde inte skapa en plan: ${error.message}`, 'system');
     }
@@ -3690,6 +3762,7 @@ Focus on the key sections and content, making it clean and modern.`;
       <div className="bg-white px-16 py-[8px] border-b border-border-faint flex items-center justify-between shadow-sm">
         <HeaderBrandKit />
         <div className="flex items-center gap-2">
+          <AuthHeaderControl />
           {/* Model Selector - Left side */}
           <select
             value={aiModel}

@@ -4,6 +4,7 @@ import { projectPlanSchema } from '@/types/plan';
 
 // A minimal plan that satisfies every required field.
 const validPlan = {
+  name: 'Enkel landningssida',
   summary: 'En enkel landningssida',
   sections: [{ name: 'Hjältesektion', description: 'Rubrik och knapp' }],
   components: [

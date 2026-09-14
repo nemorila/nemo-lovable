@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getSupabaseAdmin, PREVIEW_BUCKET, isSupabaseConfigured } from '@/lib/supabase/server';
+import { getSupabaseAdmin, PREVIEW_BUCKET, isSupabaseConfigured } from '@/lib/supabase/admin';
 import { contentTypeFor } from '@/lib/preview/content-type';
 import type { SandboxProvider } from '@/lib/sandbox/types';
+import { getSessionUser } from '@/lib/auth/session';
+import { requireOwnedProject } from '@/lib/projects/authorize';
 
 export const dynamic = 'force-dynamic';
 
@@ -20,6 +22,19 @@ export async function POST(request: NextRequest) {
     }
     if (!isSupabaseConfigured()) {
       return NextResponse.json({ success: false, error: 'Supabase is not configured' }, { status: 503 });
+    }
+
+    const user = await getSessionUser();
+    if (!user) {
+      return NextResponse.json({ success: false, error: 'Unauthorized' }, { status: 401 });
+    }
+
+    const ownership = await requireOwnedProject(projectId, user.id);
+    if (!ownership.ok) {
+      return NextResponse.json(
+        { success: false, error: ownership.status === 404 ? 'Project not found' : 'Forbidden' },
+        { status: ownership.status }
+      );
     }
 
     const provider: SandboxProvider | null = global.activeSandboxProvider ?? null;

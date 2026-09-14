@@ -11,10 +11,12 @@ const PLANNING_SYSTEM_PROMPT = `You are a senior React architect. You produce a 
 
 CRITICAL OUTPUT RULES:
 1. Return ONLY the structured plan. No code, no JSX, no file contents, no <file> tags.
-2. LANGUAGE: detect the language of the user's request and write ALL prose in that same language - summary, section names and descriptions, component descriptions, theme mood and typography, and questions. If the user writes in Swedish, answer in Swedish. If English, English.
+2. LANGUAGE: detect the language of the user's request and write ALL prose in that same language - name, summary, section names and descriptions, component descriptions, theme mood and typography, and questions. If the user writes in Swedish, answer in Swedish. If English, English.
 3. EXCEPTION - identifiers stay English ASCII: every "components[].name" MUST be a PascalCase ASCII identifier (Header, HeroSection, PricingTable) and every "components[].path" MUST be an ASCII path like "src/components/Header.jsx". These become real filenames, so they must never contain å, ä, ö, accents, spaces or non-Latin characters, no matter what language the rest of the plan is in.
 
 PLANNING RULES:
+- "name" is a short project title (3-6 words) suitable as a display name, e.g. "Takläggarsida Uppsala".
+- A "Reference page content" block, when present, is inspiration only - describe your own plan for the user's request, never copy its text or structure verbatim.
 - Every section in "sections" should map to at least one component in "components".
 - Always include a Header (with navigation) and a Footer unless the user explicitly says otherwise.
 - Component paths live under "src/components/", except App which is "src/App.jsx".
@@ -47,6 +49,12 @@ export async function POST(request: NextRequest) {
 
     if (context?.structure) {
       userParts.push(`\nExisting project structure:\n${context.structure}`);
+    }
+
+    if (context?.referencePage) {
+      userParts.push(
+        `\nReference page content (for inspiration, do not copy verbatim):\n${context.referencePage}`
+      );
     }
 
     // Revision round: keep the plan the user already saw and apply their change

@@ -1,16 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getSupabaseAdmin, PREVIEW_BUCKET, isSupabaseConfigured } from '@/lib/supabase/server';
+import { getSupabaseAdmin, PREVIEW_BUCKET, isSupabaseConfigured } from '@/lib/supabase/admin';
 import {
   contentTypeFor,
   resolvePreviewObjectPath,
   buildingPlaceholderHtml,
 } from '@/lib/preview/content-type';
+import { getProject } from '@/lib/projects/store';
+import { getSessionUser } from '@/lib/auth/session';
+import { PREVIEW_STATUS_HEADER } from '@/lib/preview/constants';
 
 export const dynamic = 'force-dynamic';
-
-// The placeholder and a real build are both 200 text/html, so the client needs
-// this header to tell them apart when deciding whether to show its overlay.
-export const PREVIEW_STATUS_HEADER = 'X-Preview-Status';
 
 function placeholderResponse() {
   return new NextResponse(buildingPlaceholderHtml(), {
@@ -24,7 +23,7 @@ function placeholderResponse() {
 }
 
 export async function GET(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ projectId: string; path?: string[] }> }
 ) {
   const { projectId, path } = await params;
@@ -35,6 +34,19 @@ export async function GET(
     return isDocument
       ? placeholderResponse()
       : new NextResponse('Preview storage is not configured', { status: 503 });
+  }
+
+  // Defense in depth: middleware already redirects unauthenticated requests
+  // to /login for this path prefix, but the service-role client below
+  // bypasses RLS, so ownership must be checked here regardless.
+  const user = await getSessionUser();
+  if (!user) {
+    return NextResponse.redirect(new URL('/login', request.url));
+  }
+
+  const project = await getProject(projectId);
+  if (project && project.owner_id !== user.id) {
+    return new NextResponse('Forbidden', { status: 403 });
   }
 
   try {

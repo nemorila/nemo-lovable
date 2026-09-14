@@ -21,11 +21,11 @@ create table public.projects (
 
 alter table public.projects enable row level security;
 
--- These policies are inert today: the app has no sign-in, so owner_id is null
--- and no anon/authenticated request can match them - which is exactly the
--- lock-down we want. The server's service role bypasses RLS entirely. When you
--- add auth later, start setting owner_id and these become live without a
--- schema migration.
+-- These policies protect direct/anon access to the table (e.g. from the
+-- publishable key). The server always uses the service-role client, which
+-- bypasses RLS entirely - so every route handler that takes a project id
+-- must independently verify auth.uid()/owner_id itself (see
+-- lib/projects/authorize.ts) rather than relying on these policies.
 create policy "owners read"   on public.projects for select using (auth.uid() = owner_id);
 create policy "owners insert" on public.projects for insert with check (auth.uid() = owner_id);
 create policy "owners update" on public.projects for update using (auth.uid() = owner_id);

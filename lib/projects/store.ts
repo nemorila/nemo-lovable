@@ -1,4 +1,4 @@
-import { getSupabaseAdmin, isSupabaseConfigured } from '@/lib/supabase/server';
+import { getSupabaseAdmin, isSupabaseConfigured, PREVIEW_BUCKET } from '@/lib/supabase/admin';
 import type { ProjectPlan } from '@/types/plan';
 
 const TABLE = 'projects';
@@ -8,6 +8,7 @@ export type ProjectFiles = Record<string, string>;
 
 export interface ProjectRow {
   id: string;
+  owner_id: string | null;
   name: string;
   files: ProjectFiles;
   plan: ProjectPlan | null;
@@ -15,15 +16,43 @@ export interface ProjectRow {
   updated_at: string;
 }
 
-export async function createProject(name = 'Untitled'): Promise<ProjectRow> {
+export async function createProject(name = 'Untitled', ownerId?: string): Promise<ProjectRow> {
   const { data, error } = await getSupabaseAdmin()
     .from(TABLE)
-    .insert({ name })
+    .insert({ name, owner_id: ownerId ?? null })
     .select()
     .single();
 
   if (error) throw new Error(`Failed to create project: ${error.message}`);
   return data as ProjectRow;
+}
+
+export async function listProjects(ownerId: string): Promise<ProjectRow[]> {
+  const { data, error } = await getSupabaseAdmin()
+    .from(TABLE)
+    .select()
+    .eq('owner_id', ownerId)
+    .order('updated_at', { ascending: false });
+
+  if (error) throw new Error(`Failed to list projects: ${error.message}`);
+  return (data as ProjectRow[]) ?? [];
+}
+
+export async function deleteProject(id: string): Promise<void> {
+  const { error } = await getSupabaseAdmin().from(TABLE).delete().eq('id', id);
+  if (error) throw new Error(`Failed to delete project ${id}: ${error.message}`);
+
+  // Best-effort: an orphaned preview build is harmless, so a storage failure
+  // here must not fail the delete itself.
+  try {
+    const storage = getSupabaseAdmin().storage.from(PREVIEW_BUCKET);
+    const { data } = await storage.list(id, { limit: 1000 });
+    if (data && data.length > 0) {
+      await storage.remove(data.map((entry) => `${id}/${entry.name}`));
+    }
+  } catch (error) {
+    console.error(`[projects] Failed to clean up preview storage for ${id}:`, error);
+  }
 }
 
 export async function getProject(id: string): Promise<ProjectRow | null> {
@@ -45,6 +74,11 @@ export async function saveProjectFiles(id: string, files: ProjectFiles): Promise
 export async function saveProjectPlan(id: string, plan: ProjectPlan): Promise<void> {
   const { error } = await getSupabaseAdmin().from(TABLE).update({ plan }).eq('id', id);
   if (error) throw new Error(`Failed to save plan for project ${id}: ${error.message}`);
+}
+
+export async function saveProjectName(id: string, name: string): Promise<void> {
+  const { error } = await getSupabaseAdmin().from(TABLE).update({ name }).eq('id', id);
+  if (error) throw new Error(`Failed to rename project ${id}: ${error.message}`);
 }
 
 /**

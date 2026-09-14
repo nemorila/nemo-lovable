@@ -4,6 +4,7 @@ import { z } from 'zod';
 // /api/apply-ai-code-stream and the editor client. The zod schema is the source
 // of truth - it is what constrains the model's structured output.
 export const projectPlanSchema = z.object({
+  name: z.string().describe("Short project title (3-6 words), in the user's language"),
   summary: z.string().describe("One or two sentences describing what will be built, in the user's language"),
   sections: z.array(
     z.object({

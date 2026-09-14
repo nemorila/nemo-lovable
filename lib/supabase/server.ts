@@ -1,36 +1,34 @@
-import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import { createServerClient } from '@supabase/ssr';
+import { cookies } from 'next/headers';
 
 /**
- * Server-only Supabase client using the service role key.
+ * Cookie-bound Supabase client for Server Components and Route Handlers.
  *
- * NEVER import this from a client component. SUPABASE_SECRET_KEY is an admin
- * credential that bypasses RLS - shipping it to the browser would hand every
- * visitor full database access.
+ * Reads the caller's session from request cookies via next/headers. Server
+ * Components can't set cookies, so the setAll() call is wrapped in try/catch -
+ * middleware is what actually refreshes the session cookie on every request.
  */
-let cachedClient: SupabaseClient | null = null;
+export async function createSupabaseServerClient() {
+  const cookieStore = await cookies();
 
-export const PREVIEW_BUCKET = 'previews';
-
-export function getSupabaseAdmin(): SupabaseClient {
-  if (cachedClient) return cachedClient;
-
-  const url = process.env.SUPABASE_URL;
-  const secretKey = process.env.SUPABASE_SECRET_KEY;
-
-  if (!url || !secretKey) {
-    throw new Error(
-      'Supabase is not configured. Set SUPABASE_URL and SUPABASE_SECRET_KEY in .env.local'
-    );
-  }
-
-  cachedClient = createClient(url, secretKey, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-
-  return cachedClient;
-}
-
-/** True when the env vars are present, so callers can degrade instead of throwing. */
-export function isSupabaseConfigured(): boolean {
-  return Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SECRET_KEY);
+  return createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY!,
+    {
+      cookies: {
+        getAll() {
+          return cookieStore.getAll();
+        },
+        setAll(cookiesToSet) {
+          try {
+            cookiesToSet.forEach(({ name, value, options }) =>
+              cookieStore.set(name, value, options)
+            );
+          } catch {
+            // Called from a Server Component - middleware handles the refresh.
+          }
+        },
+      },
+    }
+  );
 }

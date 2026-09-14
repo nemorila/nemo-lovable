@@ -7,6 +7,8 @@ import { sandboxManager } from '@/lib/sandbox/sandbox-manager';
 import { isSandboxNotFoundError, recoverSandbox } from '@/lib/sandbox/recovery';
 import { findMissingComponents } from '@/lib/plan/missing-components';
 import { tryPersistProject } from '@/lib/projects/store';
+import { getSessionUser } from '@/lib/auth/session';
+import { requireOwnedProject } from '@/lib/projects/authorize';
 
 declare global {
   var conversationState: ConversationState | null;
@@ -272,6 +274,20 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({
         error: 'response is required'
       }, { status: 400 });
+    }
+
+    if (projectId) {
+      const user = await getSessionUser();
+      if (!user) {
+        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+      }
+      const ownership = await requireOwnedProject(projectId, user.id);
+      if (!ownership.ok) {
+        return NextResponse.json(
+          { error: ownership.status === 404 ? 'Project not found' : 'Forbidden' },
+          { status: ownership.status }
+        );
+      }
     }
 
     // Debug log the response
